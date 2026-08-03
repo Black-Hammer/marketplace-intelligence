@@ -18,7 +18,7 @@ marketplace-intelligence/
 │   └── app.py                  ← Streamlit dashboard
 ├── notebooks/
 │   └── stage1_to_5_colab.ipynb ← Full pipeline Colab notebook
-├── data/
+├── **data/
 │   ├── raw/                    ← Daily CSV outputs (gitignored)
 │   └── processed/              ← Merged series and features
 ├── .github/workflows/
