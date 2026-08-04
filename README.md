@@ -2,7 +2,7 @@
 
 **MSc Data Science and Analytics | American University of Nigeria (AUN)**
 **Student:** Abubakar Salawu (A00019166)
-**Supervisor:** Dr. Zainab Usman | **Assessor:** Dr. Gabriel Ayem
+**Supervisor:** Dr. Zainab Usman | 
 
 > A multi-modal predictive framework that integrates cross-lingual consumer
 > sentiment analysis (AfriBERTa + LAFT) with LSTM-based price dynamics to
