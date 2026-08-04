@@ -1,519 +1,388 @@
 #!/usr/bin/env python3
 """
-src/fusion/train_models.py
-===========================
-Stage 4 — Train All Forecasting Arms and Write forecasts.csv (answers RQ3)
+src/sentiment/train_sentiment.py
+=================================
+Stage 1 — Sentiment Classification (answers RQ1)
 
-Trains five forecasting model arms and saves their test-set predictions to
-data/processed/forecasts.csv — the third CSV required by ch6_analysis.py.
+Trains three sentiment classifiers on NaijaSenti (HuggingFace) and saves
+test-set predictions to data/processed/classification.csv, which is one
+of the three CSV files required by ch6_analysis.py.
 
-Model arms (matching Chapter 6 Table 6.3):
-  B3  — ARIMA(2,1,2)              [classical baseline]
-  B4  — XGBoost                   [non-sequential baseline]
-  B5  — LSTM (price-only)         [deep control — primary RQ3 comparison]
-  B6  — Sentiment-only MLP        [single-modality baseline]
-  EXP — FusionRegressor           [late-fusion experimental model]
+Models trained:
+  B1  — TF-IDF (word + char n-gram) + LinearSVC        [classical baseline]
+  B2  — AfriBERTa fine-tuned directly (no LAFT)        [transformer baseline]
+  EXP — AfriBERTa + Language-Adaptive Fine-Tuning       [proposed model]
 
-Fairness guarantee:
-  ALL arms share:
-    - Identical chronological 70/15/15 data split
-    - Identical StandardScaler (fitted on training window only)
-    - Identical hyperparameter-search budget (RandomizedSearchCV, 20 iter)
-    - Identical early stopping criterion (patience=10 on validation loss)
-  The price branch of EXP is IDENTICAL to B5 so the only difference
-  between B5 and EXP is the added sentiment modality.
+Label encoding:
+  0 = positive  |  1 = negative  |  2 = neutral
 
 Output files:
-  data/processed/forecasts.csv     (date, y_true, arima, xgboost,
-                                    lstm_price, sentiment_only, fusion)
-  models/b4_xgboost.pkl
-  models/b5_lstm.pt
-  models/fusion.pt
+  data/processed/classification.csv   (y_true, b1_svm_tfidf,
+                                        b2_transformer_nolaft, laft_afriberta)
+  models/b1_svm.pkl
+  models/b2_afriberta/                (HuggingFace model directory)
+  models/laft_afriberta/              (LAFT checkpoint)
+  models/laft_cls/                    (LAFT classifier)
 
-Run in Colab (T4 GPU, ~20 min):
-  !python src/fusion/train_models.py
+Run in Colab (T4 GPU, ~45 min total):
+  !python src/sentiment/train_sentiment.py --laft_epochs 2 --task_epochs 3
 
-Run with custom epochs:
-  !python src/fusion/train_models.py --lstm_epochs 80 --fusion_epochs 80
+Run full training:
+  !python src/sentiment/train_sentiment.py --laft_epochs 3 --task_epochs 5
 """
 
 import argparse
 import logging
+import os
 import pickle
 import warnings
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
-from sklearn.metrics import mean_absolute_error, mean_squared_error
+import scipy.sparse as sp
+from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.linear_model import LogisticRegression
+from sklearn.metrics import (accuracy_score, classification_report,
+                             f1_score, precision_score, recall_score)
+from sklearn.model_selection import train_test_split
+from sklearn.svm import LinearSVC
 
 warnings.filterwarnings("ignore")
 logging.basicConfig(level=logging.INFO,
                     format="%(asctime)s [%(levelname)s] %(message)s")
-log = logging.getLogger("train_models")
+log = logging.getLogger("sentiment")
 
 # ── paths ─────────────────────────────────────────────────────────────────────
 PROC_DIR  = Path("data/processed")
 MODEL_DIR = Path("models")
+PROC_DIR.mkdir(parents=True, exist_ok=True)
 MODEL_DIR.mkdir(parents=True, exist_ok=True)
 
+# ── label map ─────────────────────────────────────────────────────────────────
+LABEL_MAP    = {"positive": 0, "negative": 1, "neutral": 2}
+LABEL_NAMES  = ["positive", "negative", "neutral"]
+MODEL_ID     = "castorini/afriberta_large"   # AfriBERTa base model
+
 
 # ══════════════════════════════════════════════════════════════════════════════
-# DATA LOADING AND SPLITTING
+# DATA LOADING
 # ══════════════════════════════════════════════════════════════════════════════
-def load_dataset() -> dict:
-    """Load the lstm_dataset.pkl produced by features.py (Stage 3)."""
-    pkl = PROC_DIR / "lstm_dataset.pkl"
-    if not pkl.exists():
-        raise FileNotFoundError(
-            "lstm_dataset.pkl not found. "
-            "Run Stage 3 (features.py) first.")
-    with open(pkl, "rb") as f:
-        data = pickle.load(f)
-    log.info("Dataset loaded — X_seq: %s  y: %s",
-             data["X_seq"].shape, data["y"].shape)
-    return data
-
-
-def make_splits(data: dict) -> dict:
+def load_naijasenti(sample_n: int = 20000) -> pd.DataFrame:
     """
-    Return train / val / test slices for every array in the dataset.
-    All splits are CHRONOLOGICAL — no shuffling. The split indices
-    were computed in features.py using the same 70/15/15 rule.
+    Load NaijaSenti from HuggingFace (four languages: hau, ibo, yor, pcm).
+    Falls back to data/raw/naijasenti.csv if offline.
+
+    NaijaSenti stats:
+      hau ~30,000 tweets  |  ibo ~30,000  |  yor ~30,000  |  pcm ~14,000
     """
-    tr, va = data["splits"]["tr"], data["splits"]["va"]
-    X  = data["X_seq"]
-    y  = data["y"]
-    Xf = data["X_flat"]
-    S  = data["sent_daily"]
-    return {
-        # LSTM sequences  (N, T, F)
-        "Xtr": X[:tr],   "Xva": X[tr:va],   "Xte": X[va:],
-        # targets         (N,)
-        "ytr": y[:tr],   "yva": y[tr:va],   "yte": y[va:],
-        # flat features   (N, F) — for XGBoost / ARIMA
-        "Ftr": Xf[:tr],  "Fva": Xf[tr:va],  "Fte": Xf[va:],
-        # sentiment index (N,)
-        "Str": S[:tr],   "Sva": S[tr:va],   "Ste": S[va:],
-        # test dates
-        "test_dates": data["dates"][va:],
-    }
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# METRIC HELPERS
-# ══════════════════════════════════════════════════════════════════════════════
-def report(name: str, y_true, y_pred, mae_ctrl: float = None):
-    mae  = mean_absolute_error(y_true, y_pred)
-    rmse = np.sqrt(mean_squared_error(y_true, y_pred))
-    if mae_ctrl:
-        pct = 100 * (mae_ctrl - mae) / mae_ctrl
-        log.info("%-20s  MAE=₦%,.2f  RMSE=₦%,.2f  %%impr=%.1f%%",
-                 name, mae, rmse, pct)
-    else:
-        log.info("%-20s  MAE=₦%,.2f  RMSE=₦%,.2f", name, mae, rmse)
-    return mae, rmse
-
-
-# ══════════════════════════════════════════════════════════════════════════════
-# B3 — ARIMA
-# ══════════════════════════════════════════════════════════════════════════════
-def train_arima(data: dict, sp: dict) -> np.ndarray:
-    """
-    ARIMA(2,1,2) with walk-forward refitting on each test observation.
-    Order selected by AIC on the training window.
-    Falls back to last observed value if fitting fails (robustness).
-    """
-    log.info("── B3: ARIMA ──")
     try:
-        from statsmodels.tsa.arima.model import ARIMA
+        from datasets import load_dataset
+        log.info("Loading NaijaSenti from HuggingFace ...")
+        dfs = []
+        for lang in ["hau", "ibo", "yor", "pcm"]:
+            try:
+                ds = load_dataset("HausaNLP/NaijaSenti", lang,
+                                  trust_remote_code=True)
+                for split_name, split in ds.items():
+                    df = split.to_pandas()
+                    df["language"] = lang
+                    df["split"]    = split_name
+                    dfs.append(df)
+                log.info("  loaded: %s", lang)
+            except Exception as e:
+                log.warning("  %s failed: %s", lang, e)
+        combined = pd.concat(dfs, ignore_index=True)
+
     except ImportError:
-        log.error("statsmodels not installed: pip install statsmodels")
-        return sp["yte"].copy()
+        log.warning("'datasets' not installed — loading from data/raw/naijasenti.csv")
+        combined = pd.read_csv("data/raw/naijasenti.csv")
 
-    tr_end   = data["splits"]["tr"]
-    y_all    = data["y"]
-    history  = list(y_all[:tr_end])
-    preds    = []
+    # normalise column names
+    combined.columns = [c.lower() for c in combined.columns]
+    if "label" not in combined.columns and "sentiment" in combined.columns:
+        combined = combined.rename(columns={"sentiment": "label"})
+    if "tweet" not in combined.columns and "text" in combined.columns:
+        combined = combined.rename(columns={"text": "tweet"})
 
-    n_test = len(sp["yte"])
-    for i in range(n_test):
-        try:
-            fc = ARIMA(history, order=(2, 1, 2)).fit().forecast(steps=1)[0]
-        except Exception:
-            fc = history[-1]   # fallback: naïve forecast
-        preds.append(fc)
-        # append the true value to history for the next step
-        true_idx = tr_end + data["splits"]["va"] - data["splits"]["tr"] + i
-        if true_idx < len(y_all):
-            history.append(y_all[true_idx])
-        else:
-            history.append(fc)
+    combined["label"] = combined["label"].astype(str).str.lower().map(LABEL_MAP)
+    combined = combined.dropna(subset=["tweet", "label"])
+    combined["label"] = combined["label"].astype(int)
 
-    preds = np.array(preds)
-    report("B3 ARIMA", sp["yte"], preds)
-    return preds
+    # stratified sample for faster Colab runs — remove .sample() for full data
+    if sample_n and len(combined) > sample_n:
+        combined = combined.groupby("label", group_keys=False).apply(
+            lambda g: g.sample(min(len(g), sample_n // 3), random_state=42))
+        log.info("Sampled %d rows (set sample_n=0 for full dataset)", len(combined))
+    else:
+        log.info("Full dataset: %d rows", len(combined))
+
+    log.info("Label distribution:\n%s", combined["label"].value_counts().to_string())
+    return combined
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# B4 — XGBoost
-# ══════════════════════════════════════════════════════════════════════════════
-def train_xgboost(sp: dict) -> np.ndarray:
-    """
-    XGBoost regressor with RandomizedSearchCV (20 iterations, 3-fold CV)
-    on the training window. Uses the flat feature matrix (not sequences).
-    Same scaler as all other arms — no refitting.
-    """
-    log.info("── B4: XGBoost (hyperparameter search) ──")
-    from xgboost import XGBRegressor
-    from sklearn.model_selection import RandomizedSearchCV
-
-    param_dist = {
-        "max_depth":         [4, 5, 6],
-        "n_estimators":      [300, 400, 600],
-        "learning_rate":     [0.03, 0.05, 0.1],
-        "subsample":         [0.7, 0.8, 1.0],
-        "colsample_bytree":  [0.7, 0.8, 1.0],
-        "min_child_weight":  [1, 3, 5],
-        "reg_lambda":        [0.5, 1.0, 2.0],
-    }
-    base = XGBRegressor(objective="reg:squarederror",
-                        early_stopping_rounds=30,
-                        random_state=42, n_jobs=-1)
-    rs = RandomizedSearchCV(
-        base, param_dist, n_iter=20, cv=3,
-        scoring="neg_mean_absolute_error",
-        random_state=42, n_jobs=-1)
-
-    # flatten sequences to 2D for XGBoost
-    Ftr = sp["Ftr"].reshape(len(sp["Ftr"]), -1)
-    Fva = sp["Fva"].reshape(len(sp["Fva"]), -1)
-    Fte = sp["Fte"].reshape(len(sp["Fte"]), -1)
-
-    rs.fit(Ftr, sp["ytr"],
-           eval_set=[(Fva, sp["yva"])],
-           verbose=False)
-    best = rs.best_estimator_
-    with open(MODEL_DIR / "b4_xgboost.pkl", "wb") as f:
-        pickle.dump(best, f)
-
-    preds = best.predict(Fte)[:len(sp["yte"])]
-    log.info("Best params: %s", rs.best_params_)
-    report("B4 XGBoost", sp["yte"], preds)
-    return preds
+def split_data(df: pd.DataFrame, text_col: str = "tweet"):
+    """Stratified chronological 70 / 15 / 15 split."""
+    X, y = df[text_col].tolist(), df["label"].tolist()
+    X_tv,  X_test, y_tv,  y_test = train_test_split(
+        X, y, test_size=0.15, stratify=y, random_state=42)
+    X_train, X_val, y_train, y_val = train_test_split(
+        X_tv, y_tv, test_size=0.15 / 0.85, stratify=y_tv, random_state=42)
+    log.info("Split — train: %d  val: %d  test: %d",
+             len(X_train), len(X_val), len(X_test))
+    return X_train, X_val, X_test, y_train, y_val, y_test
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# SHARED LSTM TRAINER
+# BASELINE B1 — TF-IDF + LinearSVC
 # ══════════════════════════════════════════════════════════════════════════════
-def _train_loop(model, train_dl, val_dl, save_path: str,
-                epochs: int = 60, lr: float = 1e-3,
-                patience: int = 10, device=None):
+def train_b1(X_train, y_train, X_val, y_val) -> dict:
     """
-    Shared Adam + ReduceLROnPlateau + early-stopping training loop.
-    Used by both B5 (price-only LSTM) and EXP (FusionRegressor).
+    TF-IDF with both word (1-2 gram) and character (3-5 gram) features
+    concatenated into one sparse matrix, then LinearSVC with balanced weights.
+    Character n-grams help capture Nigerian Pidgin morphology.
     """
-    import torch
-    import torch.nn as nn
+    log.info("── Training B1: TF-IDF + LinearSVC ──")
 
-    opt     = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-4)
-    sched   = torch.optim.lr_scheduler.ReduceLROnPlateau(opt, patience=5,
-                                                          factor=0.5)
-    loss_fn = nn.MSELoss()
-    best_val, counter = float("inf"), 0
+    vec_word = TfidfVectorizer(
+        analyzer="word", ngram_range=(1, 2),
+        max_features=30_000, sublinear_tf=True,
+        min_df=2, strip_accents="unicode"
+    )
+    vec_char = TfidfVectorizer(
+        analyzer="char_wb", ngram_range=(3, 5),
+        max_features=20_000, sublinear_tf=True, min_df=3
+    )
 
-    for ep in range(1, epochs + 1):
-        # training step
-        model.train()
-        for batch in train_dl:
-            opt.zero_grad()
-            xb  = batch[0].to(device)
-            yb  = batch[-1].to(device)
-            out = model(*batch[:-1]) if len(batch) > 2 else model(xb)
-            loss_fn(out, yb).backward()
-            opt.step()
+    # fit on training data only (no leakage)
+    X_tr = sp.hstack([vec_word.fit_transform(X_train),
+                      vec_char.fit_transform(X_train)])
+    X_va = sp.hstack([vec_word.transform(X_val),
+                      vec_char.transform(X_val)])
 
-        # validation step
-        model.eval()
-        val_losses = []
-        with torch.no_grad():
-            for batch in val_dl:
-                xb  = batch[0].to(device)
-                yb  = batch[-1].to(device)
-                out = model(*batch[:-1]) if len(batch) > 2 else model(xb)
-                val_losses.append(loss_fn(out, yb).item())
-        val_loss = float(np.mean(val_losses))
-        sched.step(val_loss)
+    clf = LinearSVC(C=1.0, class_weight="balanced", max_iter=3000)
+    clf.fit(X_tr, y_train)
 
-        # early stopping
-        if val_loss < best_val:
-            best_val = val_loss
-            counter  = 0
-            torch.save(model.state_dict(), save_path)
-        else:
-            counter += 1
-            if counter >= patience:
-                log.info("  Early stopping at epoch %d (best val=%.6f)", ep, best_val)
-                break
+    val_f1 = f1_score(y_val, clf.predict(X_va), average="macro")
+    log.info("B1 validation macro-F1: %.4f", val_f1)
 
-        if ep % 10 == 0:
-            log.info("  Epoch %3d | val_loss=%.6f", ep, val_loss)
-
-    model.load_state_dict(torch.load(save_path, map_location=device))
+    model = {"vec_word": vec_word, "vec_char": vec_char, "clf": clf}
+    with open(MODEL_DIR / "b1_svm.pkl", "wb") as f:
+        pickle.dump(model, f)
+    log.info("B1 saved → models/b1_svm.pkl")
     return model
 
 
+def predict_b1(model: dict, texts: list) -> np.ndarray:
+    X = sp.hstack([model["vec_word"].transform(texts),
+                   model["vec_char"].transform(texts)])
+    return model["clf"].predict(X)
+
+
 # ══════════════════════════════════════════════════════════════════════════════
-# B5 — LSTM (price-only control)
+# BASELINES B2 and EXP — AfriBERTa (+ LAFT)
 # ══════════════════════════════════════════════════════════════════════════════
-def train_lstm_control(sp: dict, epochs: int = 60) -> np.ndarray:
+def _get_tokenizer(model_dir: str):
+    from transformers import AutoTokenizer
+    return AutoTokenizer.from_pretrained(model_dir)
+
+
+def _make_hf_dataset(texts, labels, tokenizer, max_length: int = 128):
+    from datasets import Dataset
+    def tokenize(batch):
+        return tokenizer(batch["text"], truncation=True,
+                         max_length=max_length, padding="max_length")
+    return (Dataset.from_dict({"text": texts, "label": labels})
+            .map(tokenize, batched=True, remove_columns=["text"]))
+
+
+def _compute_metrics(p):
+    preds = np.argmax(p.predictions, axis=1)
+    return {"macro_f1": f1_score(p.label_ids, preds, average="macro")}
+
+
+def laft_mlm(X_train: list, out_dir: str = "models/laft_afriberta",
+             epochs: int = 2):
     """
-    Price-only LSTM — the PRIMARY CONTROL for the RQ3 hypothesis test.
-    Architecture: 2-layer LSTM (d_S=64) + linear head.
-    This model is trained IDENTICALLY to the price branch inside EXP
-    so that the only difference between B5 and EXP is the sentiment input.
+    Language-Adaptive Fine-Tuning (LAFT) via continued masked-language
+    modelling on the in-domain training tweets.
+    This gives AfriBERTa better representations of Nigerian Pidgin and
+    code-mixed text before task fine-tuning.
+    Requires: transformers, torch, datasets
     """
-    log.info("── B5: LSTM price-only control ──")
+    log.info("── LAFT: continued MLM on %d in-domain texts ──", len(X_train))
     try:
-        import torch
-        import torch.nn as nn
-        from torch.utils.data import DataLoader, TensorDataset
+        from transformers import (AutoModelForMaskedLM, AutoTokenizer,
+                                   DataCollatorForLanguageModeling,
+                                   Trainer, TrainingArguments)
+        from datasets import Dataset
     except ImportError:
-        log.error("torch not installed — run: pip install torch"); return sp["yte"]
+        log.error("Install transformers + torch: pip install transformers torch")
+        return
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    log.info("  Device: %s", device)
+    tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
+    model     = AutoModelForMaskedLM.from_pretrained(MODEL_ID)
 
-    def T(a): return torch.tensor(a, dtype=torch.float32)
+    def tok_mlm(batch):
+        return tokenizer(batch["text"], truncation=True,
+                         max_length=128, padding=False)
 
-    tr_dl = DataLoader(TensorDataset(T(sp["Xtr"]), T(sp["ytr"])),
-                       batch_size=32, shuffle=True)
-    va_dl = DataLoader(TensorDataset(T(sp["Xva"]), T(sp["yva"])),
-                       batch_size=64)
-
-    class LSTMControl(nn.Module):
-        def __init__(self, inp, hid=64, layers=2, drop=0.3):
-            super().__init__()
-            self.lstm = nn.LSTM(inp, hid, layers,
-                                batch_first=True, dropout=drop)
-            self.fc   = nn.Linear(hid, 1)
-        def forward(self, x):
-            out, _ = self.lstm(x.to(device))
-            return self.fc(out[:, -1, :]).squeeze(-1)
-
-    model = LSTMControl(sp["Xtr"].shape[2]).to(device)
-    model = _train_loop(model, tr_dl, va_dl,
-                        str(MODEL_DIR / "b5_lstm.pt"),
-                        epochs=epochs, device=device)
-
-    model.eval()
-    with torch.no_grad():
-        preds = model(T(sp["Xte"]).to(device)).cpu().numpy()
-
-    report("B5 LSTM (control)", sp["yte"], preds)
-    return preds
+    mlm_ds   = (Dataset.from_dict({"text": X_train})
+                .map(tok_mlm, batched=True, remove_columns=["text"]))
+    collator = DataCollatorForLanguageModeling(tokenizer,
+                                              mlm_probability=0.15)
+    args = TrainingArguments(
+        output_dir=out_dir,
+        num_train_epochs=epochs,
+        per_device_train_batch_size=16,
+        learning_rate=5e-5,
+        fp16=True,
+        save_strategy="epoch",
+        report_to="none",
+        logging_steps=100,
+    )
+    Trainer(model=model, args=args, train_dataset=mlm_ds,
+            data_collator=collator).train()
+    model.save_pretrained(out_dir)
+    tokenizer.save_pretrained(out_dir)
+    log.info("LAFT checkpoint saved → %s", out_dir)
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# B6 — Sentiment-only MLP
-# ══════════════════════════════════════════════════════════════════════════════
-def train_sentiment_mlp(sp: dict) -> np.ndarray:
+def train_classifier(model_id: str, out_dir: str,
+                     X_train, y_train, X_val, y_val,
+                     epochs: int = 3):
     """
-    Compact MLP that takes ONLY the daily sentiment index as input.
-    Included as a single-modality baseline to confirm that sentiment
-    alone is insufficient — the fusion gain must come from the combination.
+    Fine-tune AfriBERTa for 3-class sentiment classification.
+    model_id  = MODEL_ID        → trains B2 (no LAFT)
+    model_id  = laft checkpoint → trains the EXP model
+    Hyperparameters match the search space in Table 6.3 (thesis §3.3.2).
     """
-    log.info("── B6: Sentiment-only MLP ──")
+    log.info("── Fine-tuning classifier from: %s ──", model_id)
     try:
-        import torch
-        import torch.nn as nn
-        from torch.utils.data import DataLoader, TensorDataset
+        from transformers import (AutoModelForSequenceClassification,
+                                   AutoTokenizer, Trainer, TrainingArguments)
     except ImportError:
-        log.error("torch not installed."); return sp["yte"]
+        log.error("Install transformers + torch: pip install transformers torch")
+        return None
 
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    def T(a): return torch.tensor(a, dtype=torch.float32)
+    tokenizer = _get_tokenizer(model_id)
+    model     = AutoModelForSequenceClassification.from_pretrained(
+                    model_id, num_labels=3, ignore_mismatched_sizes=True)
+    tr_ds = _make_hf_dataset(X_train, y_train, tokenizer)
+    va_ds = _make_hf_dataset(X_val,   y_val,   tokenizer)
 
-    # reshape sentiment to (N, 1) for the linear layer
-    Str = sp["Str"].reshape(-1, 1)
-    Sva = sp["Sva"].reshape(-1, 1)
-    Ste = sp["Ste"].reshape(-1, 1)
-
-    tr_dl = DataLoader(TensorDataset(T(Str), T(sp["ytr"])),
-                       batch_size=32, shuffle=True)
-    va_dl = DataLoader(TensorDataset(T(Sva), T(sp["yva"])),
-                       batch_size=64)
-
-    model = nn.Sequential(
-        nn.Linear(1, 32), nn.ReLU(), nn.Dropout(0.3),
-        nn.Linear(32, 16), nn.ReLU(),
-        nn.Linear(16, 1)
-    ).to(device)
-
-    # simple training loop (no early stopping needed — model is tiny)
-    opt     = torch.optim.Adam(model.parameters(), lr=1e-3)
-    loss_fn = nn.MSELoss()
-    for _ in range(60):
-        model.train()
-        for xb, yb in tr_dl:
-            opt.zero_grad()
-            loss_fn(model(xb.to(device)).squeeze(), yb.to(device)).backward()
-            opt.step()
-
-    model.eval()
-    with torch.no_grad():
-        preds = model(T(Ste).to(device)).squeeze().cpu().numpy()
-
-    report("B6 Sentiment-only", sp["yte"], preds)
-    return preds
+    Path(out_dir).mkdir(parents=True, exist_ok=True)
+    args = TrainingArguments(
+        output_dir=out_dir,
+        num_train_epochs=epochs,
+        per_device_train_batch_size=16,
+        per_device_eval_batch_size=32,
+        learning_rate=2e-5,
+        weight_decay=0.01,
+        evaluation_strategy="epoch",
+        save_strategy="best",
+        load_best_model_at_end=True,
+        metric_for_best_model="macro_f1",
+        fp16=True,
+        report_to="none",
+        logging_steps=50,
+    )
+    trainer = Trainer(
+        model=model, args=args,
+        train_dataset=tr_ds, eval_dataset=va_ds,
+        compute_metrics=_compute_metrics,
+    )
+    trainer.train()
+    trainer.save_model(out_dir)
+    tokenizer.save_pretrained(out_dir)
+    log.info("Classifier saved → %s", out_dir)
+    return trainer
 
 
-# ══════════════════════════════════════════════════════════════════════════════
-# EXP — FusionRegressor (late-fusion experimental model)
-# ══════════════════════════════════════════════════════════════════════════════
-def train_fusion(sp: dict, epochs: int = 60,
-                 d_T: int = 64, d_S: int = 64,
-                 d_h: int = 64) -> np.ndarray:
-    """
-    Late-fusion model (Chapter 5 Listing 5.2 / Algorithm 4.4).
-
-    Architecture:
-      Price branch : 2-layer LSTM (d_S=64) — IDENTICAL config to B5
-      Text branch  : linear projection of daily sentiment → (d_T=64)
-      Fusion       : LayerNorm → concat [V_text ‖ V_time] → dense head
-
-    The LayerNorm before concatenation ensures both modalities are on
-    a comparable scale before the head makes the forecast — this is the
-    key architectural reason late fusion is appropriate here (noise
-    asymmetry between the two modalities).
-
-    The price branch weights are NOT pre-loaded from B5; both are trained
-    jointly from scratch on the same data. This is the standard evaluation
-    protocol (matched training, not transfer).
-    """
-    log.info("── EXP: FusionRegressor (late-fusion) ──")
+def predict_transformer(model_dir: str, texts: list,
+                        batch_size: int = 32) -> np.ndarray:
+    """Run inference on a saved HuggingFace classifier."""
     try:
-        import torch
-        import torch.nn as nn
-        import torch.nn.functional as F
-        from torch.utils.data import DataLoader, TensorDataset
+        from transformers import pipeline
+        pipe = pipeline(
+            "text-classification",
+            model=model_dir, tokenizer=model_dir,
+            device=0,           # GPU; use device=-1 for CPU
+            truncation=True, max_length=128,
+            batch_size=batch_size,
+        )
+        label_map = {"LABEL_0": 0, "LABEL_1": 1, "LABEL_2": 2}
+        return np.array([label_map[r["label"]] for r in pipe(texts)])
     except ImportError:
-        log.error("torch not installed."); return sp["yte"]
-
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    def T(a): return torch.tensor(a, dtype=torch.float32)
-
-    class FusionRegressor(nn.Module):
-        def __init__(self, price_feats: int):
-            super().__init__()
-            # price branch — identical to B5 control
-            self.lstm      = nn.LSTM(price_feats, d_S, 2,
-                                     batch_first=True, dropout=0.3)
-            # text projection: scalar S_t → (d_T,)
-            self.text_proj = nn.Sequential(
-                nn.Linear(1, d_T), nn.ReLU(), nn.Dropout(0.3))
-            # fusion head
-            self.head = nn.Sequential(
-                nn.LayerNorm(d_T + d_S),
-                nn.Linear(d_T + d_S, d_h), nn.ReLU(), nn.Dropout(0.3),
-                nn.Linear(d_h, 1),
-            )
-
-        def forward(self, x_price, x_sent):
-            # price branch → temporal vector V_time
-            v_time, _ = self.lstm(x_price)
-            v_time = F.layer_norm(v_time[:, -1, :],
-                                  (v_time.shape[-1],))  # (B, d_S)
-
-            # text branch → text vector V_text
-            v_text = self.text_proj(x_sent.unsqueeze(-1))
-            v_text = F.layer_norm(v_text,
-                                  (v_text.shape[-1],))  # (B, d_T)
-
-            # decision-level fusion: concatenate then dense head
-            h = torch.cat([v_text, v_time], dim=-1)     # (B, d_T+d_S)
-            return self.head(h).squeeze(-1)              # (B,)
-
-    tr_dl = DataLoader(
-        TensorDataset(T(sp["Xtr"]), T(sp["Str"]), T(sp["ytr"])),
-        batch_size=32, shuffle=True)
-    va_dl = DataLoader(
-        TensorDataset(T(sp["Xva"]), T(sp["Sva"]), T(sp["yva"])),
-        batch_size=64)
-
-    model = FusionRegressor(sp["Xtr"].shape[2]).to(device)
-
-    # wrap forward to accept (x_price, x_sent, y) batches in the loop
-    class _Wrapper(nn.Module):
-        def __init__(self, m): super().__init__(); self.m = m
-        def forward(self, x_price, x_sent):
-            return self.m(x_price.to(device), x_sent.to(device))
-
-    model = _train_loop(_Wrapper(model), tr_dl, va_dl,
-                        str(MODEL_DIR / "fusion.pt"),
-                        epochs=epochs, device=device)
-
-    model.eval()
-    with torch.no_grad():
-        preds = model(T(sp["Xte"]), T(sp["Ste"])).cpu().numpy()
-
-    report("EXP Fusion", sp["yte"], preds)
-    return preds
+        log.error("transformers not installed.")
+        return np.zeros(len(texts), dtype=int)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
-# STAGE 4 RUNNER
+# EVALUATION HELPERS
 # ══════════════════════════════════════════════════════════════════════════════
-def run_stage4(lstm_epochs: int = 60, fusion_epochs: int = 60):
+def evaluate(name: str, y_true, y_pred):
+    log.info("\n── %s test results ──", name)
+    log.info("Accuracy:  %.4f", accuracy_score(y_true, y_pred))
+    log.info("Precision: %.4f", precision_score(y_true, y_pred,
+                                                average="macro", zero_division=0))
+    log.info("Recall:    %.4f", recall_score(y_true, y_pred,
+                                             average="macro", zero_division=0))
+    log.info("Macro-F1:  %.4f", f1_score(y_true, y_pred,
+                                         average="macro", zero_division=0))
+    log.info("\n%s", classification_report(y_true, y_pred,
+                                          target_names=LABEL_NAMES,
+                                          zero_division=0))
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# STAGE 1 RUNNER
+# ══════════════════════════════════════════════════════════════════════════════
+def run_stage1(sample_n: int   = 20000,
+               laft_epochs: int = 2,
+               task_epochs: int = 3):
     """
-    Full Stage 4 pipeline:
-      1. Load lstm_dataset.pkl
-      2. Train B3 (ARIMA)
-      3. Train B4 (XGBoost, hyperparameter search)
-      4. Train B5 (LSTM price-only control)
-      5. Train B6 (Sentiment-only MLP)
-      6. Train EXP (FusionRegressor)
-      7. Save forecasts.csv for ch6_analysis.py
+    Full Stage 1 pipeline:
+      1. Load NaijaSenti
+      2. Split 70/15/15
+      3. Train B1 (TF-IDF + SVM)
+      4. Train B2 (AfriBERTa, no LAFT)
+      5. LAFT then train EXP classifier
+      6. Save classification.csv for ch6_analysis.py
     """
-    data = load_dataset()
-    sp   = make_splits(data)
+    # ── data ──────────────────────────────────────────────────────────────────
+    df = load_naijasenti(sample_n)
+    X_train, X_val, X_test, y_train, y_val, y_test = split_data(df)
 
-    arima_preds  = train_arima(data, sp)
-    xgb_preds    = train_xgboost(sp)
-    lstm_preds   = train_lstm_control(sp, lstm_epochs)
-    sent_preds   = train_sentiment_mlp(sp)
-    fusion_preds = train_fusion(sp, fusion_epochs)
+    # ── B1 ────────────────────────────────────────────────────────────────────
+    b1_model = train_b1(X_train, y_train, X_val, y_val)
+    b1_preds = predict_b1(b1_model, X_test)
+    evaluate("B1 — TF-IDF + LinearSVC", y_test, b1_preds)
 
-    # ── save forecasts.csv ────────────────────────────────────────────────────
-    # All predictions on the SAME scale (raw ₦ price).
-    # If you trained on standardised / differenced targets, invert the
-    # transform here before saving so every MAE is in the same units.
-    n_test = len(sp["yte"])
-    fc = pd.DataFrame({
-        "date":          sp["test_dates"].strftime("%Y-%m-%d"),
-        "y_true":        sp["yte"],
-        "arima":         arima_preds,
-        "xgboost":       xgb_preds[:n_test],
-        "lstm_price":    lstm_preds,
-        "sentiment_only":sent_preds,
-        "fusion":        fusion_preds,
-    })
-    out = PROC_DIR / "forecasts.csv"
-    fc.to_csv(out, index=False)
-    log.info("\n✓ forecasts.csv saved → %s", out)
-    log.info("  %d test observations | columns: date, y_true, arima, "
-             "xgboost, lstm_price, sentiment_only, fusion", n_test)
+    # ── B2 — AfriBERTa no LAFT ───────────────────────────────────────────────
+    train_classifier(MODEL_ID, "models/b2_afriberta",
+                     X_train, y_train, X_val, y_val, task_epochs)
+    b2_preds = predict_transformer("models/b2_afriberta", X_test)
+    evaluate("B2 — AfriBERTa (no LAFT)", y_test, b2_preds)
 
-    # ── final summary table ───────────────────────────────────────────────────
-    log.info("\n══ FINAL SUMMARY ══")
-    mae_ctrl, _ = report("B5 LSTM (control)", sp["yte"], lstm_preds)
-    for name, preds in [("B3 ARIMA",         arima_preds),
-                        ("B4 XGBoost",       xgb_preds[:n_test]),
-                        ("B6 Sentiment-only",sent_preds),
-                        ("EXP Fusion",       fusion_preds)]:
-        report(name, sp["yte"], preds, mae_ctrl)
+    # ── EXP — LAFT → classifier ──────────────────────────────────────────────
+    laft_mlm(X_train, "models/laft_afriberta", laft_epochs)
+    train_classifier("models/laft_afriberta", "models/laft_cls",
+                     X_train, y_train, X_val, y_val, task_epochs)
+    laft_preds = predict_transformer("models/laft_cls", X_test)
+    evaluate("EXP — AfriBERTa + LAFT", y_test, laft_preds)
 
-    log.info("\nNext: run ch6_analysis.py to produce Chapter 6 tables.")
+    # ── save classification.csv ───────────────────────────────────────────────
+    out = PROC_DIR / "classification.csv"
+    pd.DataFrame({
+        "y_true":                y_test,
+        "b1_svm_tfidf":          b1_preds,
+        "b2_transformer_nolaft": b2_preds,
+        "laft_afriberta":        laft_preds,
+    }).to_csv(out, index=False)
+    log.info("\n✓ classification.csv saved → %s", out)
+    log.info("  %d test samples | columns: y_true, b1_svm_tfidf, "
+             "b2_transformer_nolaft, laft_afriberta", len(y_test))
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -521,10 +390,12 @@ def run_stage4(lstm_epochs: int = 60, fusion_epochs: int = 60):
 # ══════════════════════════════════════════════════════════════════════════════
 if __name__ == "__main__":
     ap = argparse.ArgumentParser(
-        description="Stage 4: Train forecasting arms and write forecasts.csv")
-    ap.add_argument("--lstm_epochs",   type=int, default=60,
-                    help="Training epochs for B5 LSTM control")
-    ap.add_argument("--fusion_epochs", type=int, default=60,
-                    help="Training epochs for EXP FusionRegressor")
+        description="Stage 1: Train sentiment classifiers (RQ1)")
+    ap.add_argument("--sample_n",    type=int, default=20000,
+                    help="Rows to sample from NaijaSenti (0 = full dataset)")
+    ap.add_argument("--laft_epochs", type=int, default=2,
+                    help="Epochs for LAFT continued MLM")
+    ap.add_argument("--task_epochs", type=int, default=3,
+                    help="Epochs for classifier fine-tuning")
     args = ap.parse_args()
-    run_stage4(args.lstm_epochs, args.fusion_epochs)
+    run_stage1(args.sample_n, args.laft_epochs, args.task_epochs)
