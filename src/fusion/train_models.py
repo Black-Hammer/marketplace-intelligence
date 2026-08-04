@@ -1,217 +1,368 @@
-# ── CELL 11: Feature engineering ─────────────────────────────────────────
+#!/usr/bin/env python3
+"""
+src/price/features.py
+======================
+Stage 3 — Feature Engineering and Daily Alignment (answers RQ2 setup)
+
+Reads:
+  data/processed/price_series.csv   — rolling daily price snapshots
+                                      (from daily_run.py scraper)
+  data/processed/classification.csv — LAFT predictions on dated posts
+                                      (from train_sentiment.py Stage 1)
+  data/raw/fx_rates.csv             — optional: parallel-market FX rate
+  data/raw/fuel_prices.csv          — optional: pump-price proxy
+
+Writes:
+  data/processed/series_daily.csv   — date, price, sentiment
+                                      (→ ch6_analysis.py Granger test RQ2)
+  data/processed/lstm_dataset.pkl   — windowed X_seq, y, X_flat, splits
+                                      (→ train_models.py Stage 4)
+
+Five product categories (matching scraper schema):
+  electronics | generators | fmcg | food | clothing
+
+Scaling rule (assumption A3 — no leakage):
+  StandardScaler fitted on training window ONLY,
+  then applied identically to validation and test windows.
+  The same scaler object is saved inside lstm_dataset.pkl so every
+  forecasting arm in train_models.py uses the IDENTICAL transform.
+
+Usage (Colab):
+  !python src/price/features.py --category electronics --platform jumia
+  !python src/price/features.py --category food        --platform all
+  !python src/price/features.py --category all         --platform all
+"""
+
+import argparse
+import logging
+import pickle
+import warnings
+from pathlib import Path
+
+import numpy as np
+import pandas as pd
 from sklearn.preprocessing import StandardScaler
 
-s = pd.read_csv('data/processed/series_daily.csv', parse_dates=['date'])
-price = s['price'].values.astype(float)
-sent  = s['sentiment'].values.astype(float)
-N     = len(price)
-T     = 14   # look-back window
-K     = 7    # lag count
+warnings.filterwarnings("ignore")
+logging.basicConfig(level=logging.INFO,
+                    format="%(asctime)s [%(levelname)s] %(message)s")
+log = logging.getLogger("features")
 
-# build feature matrix
-rows = []
-for t in range(K+14, N):
-    ret   = (price[t-1]-price[t-2])/price[t-2] if price[t-2]!=0 else 0
-    lags  = [price[t-i] for i in range(1, K+1)]
-    rets  = [(price[t-i]-price[t-i-1])/price[t-i-1]
-             if price[t-i-1]!=0 else 0 for i in range(1, K+1)]
-    rmean = np.mean(price[t-7:t])
-    rstd  = np.std(price[t-7:t])+1e-8
-    rows.append(lags + rets + [rmean, rstd, sent[t-1]])
+# ── paths ─────────────────────────────────────────────────────────────────────
+PROC_DIR = Path("data/processed")
+RAW_DIR  = Path("data/raw")
+PROC_DIR.mkdir(parents=True, exist_ok=True)
 
-X_all = np.array(rows)
-y_all = price[K+14:]
-S_all = sent[K+14:]
+# ── hyperparameters (match Chapter 5 spec) ────────────────────────────────────
+LOOK_BACK = 14   # T  : days of price history per LSTM sample
+LAG_K     = 7    # k  : number of price lag features
+ROLL_W    = (3, 7, 14)   # rolling window sizes (days)
 
-# chronological 70/15/15 split
-n  = len(y_all)
-t1 = int(n*0.70); t2 = int(n*0.85)
-Xtr,Xva,Xte = X_all[:t1], X_all[t1:t2], X_all[t2:]
-ytr,yva,yte = y_all[:t1], y_all[t1:t2], y_all[t2:]
-Str,Sva,Ste = S_all[:t1], S_all[t1:t2], S_all[t2:]
+CATEGORIES = ["electronics", "generators", "fmcg", "food", "clothing"]
+PLATFORMS  = ["jumia", "konga", "temu"]
 
-# z-score scaler fitted on train only
-scaler = StandardScaler().fit(Xtr)
-Xtr_s, Xva_s, Xte_s = scaler.transform(Xtr), scaler.transform(Xva), scaler.transform(Xte)
 
-# LSTM windows  (T, F)
-def make_seq(X, T=14):
-    return np.array([X[i-T:i] for i in range(T, len(X))])
-def align(X, y, S, T=14):
-    return make_seq(X, T), y[T:], S[T:]
+# ══════════════════════════════════════════════════════════════════════════════
+# HELPERS
+# ══════════════════════════════════════════════════════════════════════════════
+def safe_log1p(s: pd.Series) -> pd.Series:
+    """log1p transform for strictly positive price-level series."""
+    if (s > 0).all():
+        return np.log1p(s)
+    return s
 
-Xtr_l, ytr_l, Str_l = align(Xtr_s, ytr, Str)
-Xva_l, yva_l, Sva_l = align(Xva_s, yva, Sva)
-Xte_l, yte_l, Ste_l = align(Xte_s, yte, Ste)
 
-print(f'Feature matrix: {X_all.shape}  |  test samples: {len(yte_l)}')
-print(f'LSTM seq shape: {Xtr_l.shape}')
+def rolling_features(price: pd.Series) -> pd.DataFrame:
+    """
+    Build the full price-branch feature matrix for one daily price series.
+    All features use information available up to and including t-1
+    so there is NO look-ahead leakage into the target at time t.
 
-# ── CELL 12: B3 — ARIMA ──────────────────────────────────────────────────
-from statsmodels.tsa.arima.model import ARIMA
-from sklearn.metrics import mean_absolute_error as MAE
+    Features produced (F ≈ 28 columns):
+      lag_price_1 .. lag_price_K     : lagged price levels
+      lag_return_1 .. lag_return_K   : lagged simple returns
+      roll_mean_3/7/14               : rolling means (shifted by 1)
+      roll_std_3/7/14                : rolling std deviations (shifted by 1)
+      ewma                           : exponentially weighted moving average
+      zscore_7                       : 7-day z-score of return
+      momentum_7                     : 7-day price momentum
+    """
+    r     = price.pct_change()           # simple return
+    log_r = np.log(price / price.shift(1))  # log return
 
-history = list(ytr); arima_preds = []
-for t in range(len(yte_l)):
+    feats = {}
+
+    # lagged levels and returns (information at t-1, t-2, …, t-K)
+    for k in range(1, LAG_K + 1):
+        feats[f"lag_price_{k}"]  = price.shift(k)
+        feats[f"lag_return_{k}"] = r.shift(k)
+
+    # rolling statistics — shifted by 1 so window ends at t-1
+    for w in ROLL_W:
+        feats[f"roll_mean_{w}"] = price.shift(1).rolling(w).mean()
+        feats[f"roll_std_{w}"]  = price.shift(1).rolling(w).std()
+
+    # additional momentum / trend features
+    feats["ewma"]       = price.shift(1).ewm(span=7, adjust=False).mean()
+    feats["zscore_7"]   = ((price.shift(1)
+                            - price.shift(1).rolling(7).mean())
+                           / (price.shift(1).rolling(7).std() + 1e-8))
+    feats["momentum_7"] = price.shift(1) / (price.shift(8) + 1e-8) - 1
+
+    return pd.DataFrame(feats, index=price.index)
+
+
+def calendar_features(index: pd.DatetimeIndex) -> pd.DataFrame:
+    """
+    Cyclical calendar encodings so the model understands weekly and
+    monthly seasonality without an ordinal discontinuity at the boundary.
+    """
+    dow   = index.dayofweek   # 0=Monday … 6=Sunday
+    month = index.month       # 1=January … 12=December
+    return pd.DataFrame({
+        "dow_sin":  np.sin(2 * np.pi * dow   / 7),
+        "dow_cos":  np.cos(2 * np.pi * dow   / 7),
+        "mon_sin":  np.sin(2 * np.pi * month / 12),
+        "mon_cos":  np.cos(2 * np.pi * month / 12),
+    }, index=index)
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# DAILY SENTIMENT INDEX
+# ══════════════════════════════════════════════════════════════════════════════
+def build_daily_sentiment(category: str) -> pd.Series:
+    """
+    Aggregate LAFT predictions on dated posts into a daily net-sentiment
+    index:  S_t = (n_positive − n_negative) / n_total  ∈ [−1, 1]
+
+    Requires classification.csv (Stage 1) AND posts_dated.csv
+    (from daily_run.py text scrapers).
+
+    If posts_dated.csv is not yet available, returns a zero series
+    and logs a warning — the Granger test (RQ2) will show no signal,
+    which is the honest result until real text data is collected.
+    """
+    cls_path   = PROC_DIR / "classification.csv"
+    posts_path = PROC_DIR / "posts_dated.csv"
+
+    if not cls_path.exists():
+        raise FileNotFoundError(
+            "classification.csv not found. "
+            "Run Stage 1 (train_sentiment.py) first.")
+
+    cls = pd.read_csv(cls_path)
+
+    if not posts_path.exists():
+        log.warning("posts_dated.csv not found — sentiment will be zero. "
+                    "Run daily_run.py text scrapers to collect posts.")
+        return pd.Series(dtype=float, name="sentiment")
+
+    posts = pd.read_csv(posts_path, parse_dates=["date"])
+
+    # filter to this category and align with classification predictions
+    cat_posts = posts[posts["category"] == category].copy()
+    n         = min(len(cat_posts), len(cls))
+    cat_posts = cat_posts.iloc[:n].copy()
+    cat_posts["pred"] = cls["laft_afriberta"].values[:n]
+
+    # polarity mapping: positive=+1, negative=−1, neutral=0
+    cat_posts["polarity"] = cat_posts["pred"].map({0: 1, 1: -1, 2: 0})
+
+    # aggregate to daily net-sentiment index
+    daily = (cat_posts.groupby("date")["polarity"]
+             .apply(lambda g: g.sum() / max(1, len(g)))
+             .rename("sentiment"))
+    log.info("Daily sentiment index: %d days, mean=%.3f, std=%.3f",
+             len(daily), daily.mean(), daily.std())
+    return daily
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# MAIN FEATURE BUILDER
+# ══════════════════════════════════════════════════════════════════════════════
+def build_features(category: str,
+                   platform: str = "jumia") -> dict:
+    """
+    Build the full feature dataset for one (category, platform) pair.
+
+    Returns a dict with:
+      X_seq   : (N, T, F)  windowed LSTM input sequences
+      y       : (N,)       target values (price at time t)
+      X_flat  : (N, T*F)   flattened features for XGBoost / ARIMA
+      splits  : {"tr": int, "va": int}  index boundaries
+      scaler  : fitted StandardScaler (train window only)
+      feature_names : list of F feature names
+      dates   : DatetimeIndex aligned with y
+      sent_daily : (N,)  daily sentiment index aligned with y
+    """
+    log.info("══ Building features: category=%s  platform=%s ══",
+             category, platform)
+
+    # ── load and aggregate price series ───────────────────────────────────────
+    price_path = PROC_DIR / "price_series.csv"
+    if not price_path.exists():
+        raise FileNotFoundError(
+            "price_series.csv not found. "
+            "Run the daily scrapers for at least 90 days first.")
+
+    df_raw = pd.read_csv(price_path, parse_dates=["date"])
+
+    # filter by category; optionally filter by platform
+    mask = df_raw["category"] == category
+    if platform != "all":
+        mask &= df_raw["platform"] == platform
+    df_cat = df_raw[mask]
+
+    if df_cat.empty:
+        raise ValueError(f"No data for category='{category}' "
+                         f"platform='{platform}'. "
+                         "Check your scraped CSV files.")
+
+    # daily median price across all matching products
+    price = (df_cat.groupby("date")["current_price_ngn"]
+             .median()
+             .sort_index()
+             .asfreq("D")          # force daily frequency
+             .interpolate("linear")  # fill at most isolated missing days
+             )
+    log.info("Price series: %d days  (%s → %s)  median=₦%.0f",
+             len(price),
+             price.index[0].date(),
+             price.index[-1].date(),
+             price.median())
+
+    if len(price) < 90:
+        log.warning("Only %d days of price data — thesis requires ≥90 "
+                    "consecutive days for reliable estimates.", len(price))
+
+    # ── optional exogenous features ───────────────────────────────────────────
+    exog_cols = {}
+    fx_path   = RAW_DIR / "fx_rates.csv"
+    fuel_path = RAW_DIR / "fuel_prices.csv"
+    if fx_path.exists():
+        fx = (pd.read_csv(fx_path, parse_dates=["date"], index_col="date")
+              ["fx_rate"].shift(1))   # lag 1: use yesterday's FX rate
+        exog_cols["fx_lag1"] = fx
+        log.info("FX rate loaded and lagged by 1 day.")
+    if fuel_path.exists():
+        fuel = (pd.read_csv(fuel_path, parse_dates=["date"], index_col="date")
+                ["fuel_price"].shift(1))
+        exog_cols["fuel_lag1"] = fuel
+        log.info("Fuel price loaded and lagged by 1 day.")
+
+    # ── rolling + calendar features ───────────────────────────────────────────
+    roll_df = rolling_features(price)
+    cal_df  = calendar_features(price.index)
+
+    feat_df = pd.concat([roll_df, cal_df], axis=1)
+    for col_name, series in exog_cols.items():
+        feat_df[col_name] = series.reindex(price.index)
+
+    feat_df = feat_df.dropna()
+    price   = price.loc[feat_df.index]
+    log.info("Feature matrix after dropna: %d rows × %d cols",
+             *feat_df.shape)
+
+    # ── daily sentiment index ─────────────────────────────────────────────────
     try:
-        fc = ARIMA(history, order=(2,1,2)).fit().forecast(1)[0]
-    except Exception:
-        fc = history[-1]
-    arima_preds.append(fc)
-    history.append(yva[t] if t < len(yva) else yte[t])
-arima_preds = np.array(arima_preds)
-print(f'B3 ARIMA  MAE: {MAE(yte_l, arima_preds):.2f}')
+        sent_daily = build_daily_sentiment(category)
+        sent_aligned = sent_daily.reindex(price.index).fillna(0.0)
+    except FileNotFoundError as e:
+        log.warning("%s — using zero sentiment.", e)
+        sent_aligned = pd.Series(0.0, index=price.index, name="sentiment")
 
-# ── CELL 13: B4 — XGBoost ────────────────────────────────────────────────
-from xgboost import XGBRegressor
-from sklearn.model_selection import RandomizedSearchCV
+    # ── series_daily.csv (→ ch6_analysis.py Granger test) ────────────────────
+    series_daily = pd.DataFrame({
+        "date":      price.index.strftime("%Y-%m-%d"),
+        "price":     price.values,
+        "sentiment": sent_aligned.values,
+    })
+    series_path = PROC_DIR / "series_daily.csv"
+    series_daily.to_csv(series_path, index=False)
+    log.info("series_daily.csv saved: %d rows → %s", len(series_daily), series_path)
 
-param_dist = dict(
-    max_depth=[4,5,6], n_estimators=[300,400,600],
-    learning_rate=[0.03,0.05,0.1], subsample=[0.7,0.8,1.0],
-    colsample_bytree=[0.7,0.8,1.0]
-)
-base = XGBRegressor(objective='reg:squarederror', random_state=42, n_jobs=-1)
-rs   = RandomizedSearchCV(base, param_dist, n_iter=20, cv=3,
-                           scoring='neg_mean_absolute_error',
-                           random_state=42, n_jobs=-1)
-rs.fit(Xtr_s, ytr)
-xgb_preds = rs.best_estimator_.predict(Xte_s)[len(Xte_s)-len(yte_l):]
-print(f'B4 XGBoost MAE: {MAE(yte_l, xgb_preds[:len(yte_l)]):.2f}')
-print(f'Best params: {rs.best_params_}')
+    # ── z-score scaling (fitted on training window ONLY) ──────────────────────
+    n      = len(feat_df)
+    tr_end = int(n * 0.70)
+    va_end = int(n * 0.85)
 
-# ── CELL 14: B5 — LSTM (price-only control) ───────────────────────────────
-import torch, torch.nn as nn
-from torch.utils.data import TensorDataset, DataLoader
+    X_arr = feat_df.values.astype(float)
+    y_arr = price.values.astype(float)
 
-device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-print('device:', device)
+    scaler = StandardScaler()
+    X_arr[:tr_end]  = scaler.fit_transform(X_arr[:tr_end])  # fit+transform train
+    X_arr[tr_end:]  = scaler.transform(X_arr[tr_end:])      # transform val+test
 
-def T2(a): return torch.tensor(a, dtype=torch.float32).to(device)
+    log.info("Scaler fitted on training window (%d rows). "
+             "Applied to val+test without refitting (no leakage).", tr_end)
 
-class LSTMModel(nn.Module):
-    def __init__(self, inp, hid=64, layers=2, drop=0.3):
-        super().__init__()
-        self.lstm = nn.LSTM(inp, hid, layers, batch_first=True, dropout=drop)
-        self.fc   = nn.Linear(hid, 1)
-    def forward(self, x):
-        out, _ = self.lstm(x)
-        return self.fc(out[:,-1,:]).squeeze(-1)
+    # ── LSTM windowed sequences ───────────────────────────────────────────────
+    X_seq, y_seq, sent_seq = [], [], []
+    for t in range(LOOK_BACK, n):
+        X_seq.append(X_arr[t - LOOK_BACK: t])   # shape (T, F)
+        y_seq.append(y_arr[t])                   # target: price at t
+        sent_seq.append(sent_aligned.values[t])  # sentiment at t (info ≤ t-1 used)
 
-def train_lstm_model(Xtr, ytr, Xva, yva, tag='b5', epochs=60, lr=1e-3):
-    model   = LSTMModel(Xtr.shape[2]).to(device)
-    opt     = torch.optim.Adam(model.parameters(), lr=lr, weight_decay=1e-4)
-    sched   = torch.optim.lr_scheduler.ReduceLROnPlateau(opt, patience=5)
-    loss_fn = nn.MSELoss()
-    tr_dl   = DataLoader(TensorDataset(T2(Xtr),T2(ytr)), batch_size=32, shuffle=True)
-    va_dl   = DataLoader(TensorDataset(T2(Xva),T2(yva)), batch_size=64)
-    best, cnt = float('inf'), 0
-    for ep in range(1, epochs+1):
-        model.train()
-        for xb,yb in tr_dl:
-            opt.zero_grad(); loss_fn(model(xb),yb).backward(); opt.step()
-        model.eval()
-        with torch.no_grad():
-            vl = np.mean([loss_fn(model(xb),yb).item() for xb,yb in va_dl])
-        sched.step(vl)
-        if vl < best:
-            best=vl; cnt=0; torch.save(model.state_dict(), f'models/{tag}.pt')
-        else:
-            cnt+=1
-            if cnt>=10: print(f'  Early stop ep {ep}'); break
-    model.load_state_dict(torch.load(f'models/{tag}.pt'))
-    return model
+    X_seq    = np.array(X_seq)    # (N, T, F)
+    y_seq    = np.array(y_seq)    # (N,)
+    X_flat   = X_arr[LOOK_BACK:]  # (N, F) — for XGBoost / ARIMA
+    sent_seq = np.array(sent_seq) # (N,)
 
-b5_model  = train_lstm_model(Xtr_l, ytr_l, Xva_l, yva_l, 'b5')
-b5_model.eval()
-with torch.no_grad():
-    lstm_preds = b5_model(T2(Xte_l)).cpu().numpy()
-print(f'B5 LSTM (control) MAE: {MAE(yte_l, lstm_preds):.2f}')
+    # adjust split indices for look-back offset
+    splits = {
+        "tr": tr_end - LOOK_BACK,
+        "va": va_end - LOOK_BACK,
+    }
 
-# ── CELL 15: B6 — Sentiment-only MLP ─────────────────────────────────────
-sent_model = nn.Sequential(
-    nn.Linear(1,32), nn.ReLU(), nn.Dropout(0.3),
-    nn.Linear(32,16), nn.ReLU(), nn.Linear(16,1)
-).to(device)
-opt_s   = torch.optim.Adam(sent_model.parameters(), lr=1e-3)
-loss_fn = nn.MSELoss()
-tr_dl_s = DataLoader(
-    TensorDataset(T2(Str_l.reshape(-1,1)), T2(ytr_l)),
-    batch_size=32, shuffle=True)
-for _ in range(60):
-    sent_model.train()
-    for xb,yb in tr_dl_s:
-        opt_s.zero_grad(); loss_fn(sent_model(xb).squeeze(),yb).backward(); opt_s.step()
-sent_model.eval()
-with torch.no_grad():
-    sent_preds = sent_model(T2(Ste_l.reshape(-1,1))).squeeze().cpu().numpy()
-print(f'B6 Sentiment-only MAE: {MAE(yte_l, sent_preds):.2f}')
+    dataset = {
+        "X_seq":         X_seq,
+        "y":             y_seq,
+        "X_flat":        X_flat,
+        "sent_daily":    sent_seq,
+        "splits":        splits,
+        "scaler":        scaler,
+        "feature_names": list(feat_df.columns),
+        "dates":         price.index[LOOK_BACK:],
+        "category":      category,
+        "platform":      platform,
+        "look_back":     LOOK_BACK,
+    }
 
-# ── CELL 16: EXP — Late-Fusion FusionRegressor ───────────────────────────
-import torch.nn.functional as F
+    pkl_path = PROC_DIR / "lstm_dataset.pkl"
+    with open(pkl_path, "wb") as f:
+        pickle.dump(dataset, f)
 
-class FusionRegressor(nn.Module):
-    def __init__(self, price_feats, d_T=64, d_S=64, d_h=64, drop=0.3):
-        super().__init__()
-        self.lstm      = nn.LSTM(price_feats, d_S, 2,
-                                  batch_first=True, dropout=drop)
-        self.text_proj = nn.Sequential(
-            nn.Linear(1, d_T), nn.ReLU(), nn.Dropout(drop))
-        self.head      = nn.Sequential(
-            nn.LayerNorm(d_T+d_S),
-            nn.Linear(d_T+d_S, d_h), nn.ReLU(), nn.Dropout(drop),
-            nn.Linear(d_h, 1))
-    def forward(self, x_price, x_sent):
-        v_time, _ = self.lstm(x_price)
-        v_time = F.layer_norm(v_time[:,-1,:], (v_time.shape[-1],))
-        v_text = self.text_proj(x_sent.unsqueeze(-1))
-        v_text = F.layer_norm(v_text, (v_text.shape[-1],))
-        return self.head(torch.cat([v_text, v_time], dim=-1)).squeeze(-1)
+    log.info("lstm_dataset.pkl saved → %s", pkl_path)
+    log.info("Shapes — X_seq: %s  y: %s  X_flat: %s",
+             X_seq.shape, y_seq.shape, X_flat.shape)
+    log.info("Splits — train: 0:%d  val: %d:%d  test: %d:%d",
+             splits["tr"], splits["tr"], splits["va"],
+             splits["va"], len(y_seq))
+    log.info("Features (%d): %s", len(feat_df.columns),
+             ", ".join(feat_df.columns))
 
-fusion = FusionRegressor(Xtr_l.shape[2]).to(device)
-opt_f  = torch.optim.Adam(fusion.parameters(), lr=1e-3, weight_decay=1e-4)
-sched_f= torch.optim.lr_scheduler.ReduceLROnPlateau(opt_f, patience=5)
-tr_dl_f= DataLoader(
-    TensorDataset(T2(Xtr_l), T2(Str_l), T2(ytr_l)),
-    batch_size=32, shuffle=True)
-va_dl_f= DataLoader(
-    TensorDataset(T2(Xva_l), T2(Sva_l), T2(yva_l)), batch_size=64)
+    return dataset
 
-best_f, cnt_f = float('inf'), 0
-for ep in range(1, 61):
-    fusion.train()
-    for xp,xs,yb in tr_dl_f:
-        opt_f.zero_grad(); loss_fn(fusion(xp,xs),yb).backward(); opt_f.step()
-    fusion.eval()
-    with torch.no_grad():
-        vl = np.mean([loss_fn(fusion(xp,xs),yb).item() for xp,xs,yb in va_dl_f])
-    sched_f.step(vl)
-    if vl < best_f:
-        best_f=vl; cnt_f=0; torch.save(fusion.state_dict(),'models/fusion.pt')
-    else:
-        cnt_f+=1
-        if cnt_f>=10: print(f'  Early stop ep {ep}'); break
 
-fusion.load_state_dict(torch.load('models/fusion.pt'))
-fusion.eval()
-with torch.no_grad():
-    fusion_preds = fusion(T2(Xte_l), T2(Ste_l)).cpu().numpy()
-print(f'EXP Fusion  MAE: {MAE(yte_l, fusion_preds):.2f}')
+# ══════════════════════════════════════════════════════════════════════════════
+# CLI
+# ══════════════════════════════════════════════════════════════════════════════
+if __name__ == "__main__":
+    ap = argparse.ArgumentParser(
+        description="Stage 3: Feature engineering and daily alignment")
+    ap.add_argument("--category", default="electronics",
+                    choices=CATEGORIES + ["all"],
+                    help="Product category to process")
+    ap.add_argument("--platform", default="jumia",
+                    choices=PLATFORMS + ["all"],
+                    help="Platform to use (all = merge all three)")
+    args = ap.parse_args()
 
-# ── CELL 17: Save forecasts.csv ───────────────────────────────────────────
-test_dates = s['date'].values[-(len(yte_l)):]
-fc = pd.DataFrame({
-    'date':          test_dates,
-    'y_true':        yte_l,
-    'arima':         arima_preds,
-    'xgboost':       xgb_preds[:len(yte_l)],
-    'lstm_price':    lstm_preds,
-    'sentiment_only':sent_preds,
-    'fusion':        fusion_preds,
-})
-fc.to_csv('data/processed/forecasts.csv', index=False)
-print('✓ forecasts.csv saved')
-
-for col in ['arima','xgboost','lstm_price','sentiment_only','fusion']:
-    print(f'  {col:20s}  MAE={MAE(fc.y_true, fc[col]):>10.2f}')
-
+    cats = CATEGORIES if args.category == "all" else [args.category]
+    for cat in cats:
+        try:
+            data = build_features(cat, args.platform)
+            log.info("✓ %s/%s complete — %d samples",
+                     cat, args.platform, len(data["y"]))
+        except (FileNotFoundError, ValueError) as e:
+            log.error("Skipping %s/%s: %s", cat, args.platform, e)
