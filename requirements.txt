@@ -1,0 +1,40 @@
+# ── Core data science ─────────────────────────────────────────────────────────
+pandas>=2.0
+numpy>=1.24
+scikit-learn>=1.4
+scipy>=1.11
+statsmodels>=0.14
+xgboost>=2.0
+
+# ── Web scraping ──────────────────────────────────────────────────────────────
+requests>=2.31
+beautifulsoup4>=4.12
+fake-useragent>=1.4
+# snscrape              # Twitter fallback — install separately:
+#                       # pip install git+https://github.com/JustAnotherArchivist/snscrape.git
+
+# ── NLP and transformers ──────────────────────────────────────────────────────
+transformers>=4.40
+datasets>=2.18
+accelerate>=0.29       # required by Trainer for fp16 / multi-GPU
+tokenizers>=0.19       # fast tokenizer for AfriBERTa
+
+# ── PyTorch (CPU default — override for GPU in Colab) ─────────────────────────
+# CPU:  pip install torch
+# GPU:  pip install torch --index-url https://download.pytorch.org/whl/cu118
+torch>=2.2
+
+# ── Analysis and reporting ────────────────────────────────────────────────────
+tabulate>=0.9          # Markdown table output in ch6_analysis.py
+matplotlib>=3.8        # Loss-curve plots
+seaborn>=0.13          # Chapter 6 visualisations
+
+# ── Dashboard ─────────────────────────────────────────────────────────────────
+streamlit>=1.33
+plotly>=5.20           # Interactive charts in Streamlit app
+
+# ── Persistence ───────────────────────────────────────────────────────────────
+# pickle is stdlib — no install needed
+
+# ── Development and testing ───────────────────────────────────────────────────
+pytest>=8.0
