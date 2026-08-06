@@ -55,9 +55,14 @@ Write-Host "Installing dependencies — this takes a few minutes on a fresh mach
 
 # 5. Theme config, written without a byte-order mark (Out-File would add one
 #    and Streamlit's TOML parser rejects it).
-if (-not (Test-Path ".\.streamlit")) { New-Item -ItemType Directory -Path ".streamlit" | Out-Null }
+# Written to the repository root when there is one, because that is where both
+# Streamlit locally and Community Cloud look for it.
+$configRoot = if (Test-Path "..\data\processed") { (Resolve-Path "..").Path } else { $PWD.Path }
+if (-not (Test-Path "$configRoot\.streamlit")) {
+    New-Item -ItemType Directory -Path "$configRoot\.streamlit" | Out-Null
+}
 $toml = "[theme]`nbase = `"light`"`nprimaryColor = `"#0E6B60`"`nbackgroundColor = `"#F3F5F4`"`nsecondaryBackgroundColor = `"#FFFFFF`"`ntextColor = `"#12211F`"`n"
-[IO.File]::WriteAllText("$PWD\.streamlit\config.toml", $toml)
+[IO.File]::WriteAllText("$configRoot\.streamlit\config.toml", $toml)
 
 Write-Host ""
 Write-Host "Ready. Start the dashboard with:  .\run.ps1" -ForegroundColor Green
