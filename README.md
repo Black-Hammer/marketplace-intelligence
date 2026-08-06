@@ -183,7 +183,7 @@ marketplace-intelligence/
 │   └── daily_scrape.yml              # GitHub Actions: automated daily scraping
 │
 ├── requirements.txt
-├── GITHUB_SETUP_GUIDE.md             # Step-by-step setup instructions
+├── .gitignore
 └── README.md
 ```
 
