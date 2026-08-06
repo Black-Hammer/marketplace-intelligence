@@ -216,3 +216,14 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# ---- thesis project ----
+models/
+*.safetensors
+*.bin
+*.pt
+*.ckpt
+data/raw/
+data/interim/
+*.parquet
+*.pkl
