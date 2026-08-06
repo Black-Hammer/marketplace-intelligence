@@ -31,7 +31,7 @@ seaborn>=0.13          # Chapter 6 visualisations
 
 # ── Dashboard ─────────────────────────────────────────────────────────────────
 streamlit>=1.33
-plotly>=5.20           # Interactive charts in Streamlit app
+altair>=5.0            # every chart in dashboard/charts.py
 
 # ── Persistence ───────────────────────────────────────────────────────────────
 # pickle is stdlib — no install needed
