@@ -72,17 +72,57 @@ cd marketplace-intelligence
 # 2. Install dependencies
 pip install -r requirements.txt
 
-# 3. Run the dashboard (prototype mode — no trained models needed)
-streamlit run app/app.py
+# 3. Run the dashboard from the repository root
+streamlit run dashboard/app.py
 ```
 
-**Run in Google Colab (GPU recommended):**
+**Windows, first time on a machine:**
+
+```powershell
+Set-ExecutionPolicy -Scope CurrentUser RemoteSigned
+cd dashboard
+.\setup.ps1     # finds Python, builds the venv, installs, writes the theme
+.\run.ps1       # starts the dashboard
+```
+
+Launch from the **repository root** so the sidebar's default `data/processed`
+resolves. The three result tables are committed, so the dashboard opens on real
+results with nothing to configure. If any is missing or malformed it falls back
+to clearly labelled demonstration data — those numbers are generated and must
+never be reported.
+
+**Run the pipeline in Google Colab (GPU recommended):**
 ```python
 !git clone https://github.com/Black-Hammer/marketplace-intelligence.git
 %cd marketplace-intelligence
 !pip install -r requirements.txt
-# Then open notebooks/stage1_to_5_colab.ipynb
+# Then open notebooks/marketplace_intelligence_pipeline.ipynb
 ```
+
+---
+
+## Dashboard
+
+Six tabs mapped to the research questions: **Overview**, **Sentiment · RQ1**,
+**Lead & lag · RQ2**, **Forecast · RQ3**, **Early warning**, **Data & export**.
+
+| File | Role |
+|------|------|
+| `dashboard/app.py` | Interface: layout, tabs, controls |
+| `dashboard/core.py` | Loading, schema validation, and every statistic on screen |
+| `dashboard/charts.py` | Shared Altair theme and chart builders |
+| `dashboard/setup.ps1` · `run.ps1` | Windows setup and launcher |
+
+All three Python files must sit in the same folder — `app.py` imports the other
+two from alongside it.
+
+Every figure is computed from the CSVs at render time, so a table in Chapter 6
+and the same table in the app cannot drift apart. The Early warning panel labels
+live comments with a code-mixed keyword lexicon and states so on screen; wiring
+in the trained classifier is described in `dashboard/README.md`.
+
+Reads `classification.csv` (RQ1), `series_daily.csv` (RQ2) and `forecasts.csv`
+(RQ3) from `data/processed`, or from files uploaded through the sidebar.
 
 ---
 
@@ -123,15 +163,19 @@ marketplace-intelligence/
 │   └── evaluation/
 │       └── ch6_analysis.py           # DM test · Granger · McNemar · metric tables
 │
-├── app/
-│   └── app.py                        # Streamlit decision-intelligence dashboard
+├── dashboard/
+│   ├── app.py                        # Streamlit interface — six tabs, one per RQ
+│   ├── core.py                       # Loading, validation, statistics
+│   ├── charts.py                     # Altair theme and chart builders
+│   ├── setup.ps1 · run.ps1           # Windows setup and launcher
+│   └── README.md                     # Dashboard-specific notes
 │
 ├── notebooks/
-│   └── stage1_to_5_colab.ipynb       # Full pipeline Colab notebook (T4 GPU)
+│   └── marketplace_intelligence_pipeline.ipynb   # Full pipeline (Colab, T4 GPU)
 │
 ├── data/
 │   ├── raw/                          # Daily scrape CSVs (gitignored)
-│   └── processed/                    # Merged series, features, model outputs
+│   └── processed/                    # classification.csv · series_daily.csv · forecasts.csv (committed)
 │
 ├── models/                           # Saved model weights (gitignored)
 │
@@ -271,4 +315,6 @@ Student ID: A00019166
 
 ## Licence
 
-MIT © 2026 Abubakar Salawu
+MIT © 2026 Abubakar Salawu — **applies to the code in this repository only.**
+Scraped marketplace data remains subject to the source platforms' terms of use,
+and the NaijaSenti and AfriSenti corpora carry their own licences.
