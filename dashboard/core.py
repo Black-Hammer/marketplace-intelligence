@@ -29,8 +29,10 @@ import pandas as pd
 # Conventions
 # --------------------------------------------------------------------------
 
-# NaijaSenti integer encoding used throughout the pipeline.
-LABELS = {0: "Negative", 1: "Neutral", 2: "Positive"}
+# Encoding set in Cell 1.1 of the pipeline: LABEL_MAP = {'positive':0,
+# 'negative':1, 'neutral':2}. Note this is NOT the conventional 0=negative
+# ordering -- change it here if the notebook's LABEL_MAP ever changes.
+LABELS = {0: "Positive", 1: "Negative", 2: "Neutral"}
 
 # Sentiment model columns in classification.csv, in reporting order.
 CLF_ARMS = {
