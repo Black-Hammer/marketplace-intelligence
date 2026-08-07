@@ -74,6 +74,9 @@ pip install -r requirements.txt
 
 # 3. Run the dashboard from the repository root
 streamlit run dashboard/app.py
+
+# 4.
+See [results/RESULTS.md](results/RESULTS.md) for the headline tables.
 ```
 
 **Windows, first time on a machine:**
