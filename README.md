@@ -95,7 +95,7 @@ never be reported.
 
 **Run the pipeline in Google Colab (GPU recommended):**
 ```python
-!git clone https://github.com/Black-Hammer/marketplace-intelligence.git
+!git clone https://github.com/abu-salawu/marketplace-intelligence.git
 %cd marketplace-intelligence
 !pip install -r requirements.txt
 # Then open notebooks/marketplace_intelligence_pipeline.ipynb
