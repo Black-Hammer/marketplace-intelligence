@@ -6,8 +6,7 @@
 
 > A multi-modal predictive framework that integrates cross-lingual consumer
 > sentiment analysis (AfriBERTa + LAFT) with LSTM-based price dynamics to
-> forecast e-commerce price volatility on Nigerian platforms — Jumia, Konga,
-> and Temu.
+> forecast e-commerce price volatility on Nigerian platforms
 
 ---
 
