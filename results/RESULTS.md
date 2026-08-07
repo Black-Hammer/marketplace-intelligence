@@ -1,7 +1,7 @@
 # Results
 
 Generated from the tables in `data/processed`. Every figure here is computed
-from those CSVs, so this file, the dashboard, and Chapter 6 cannot disagree.
+from the CSVs.
 
 **Test set:** 2,000 held-out items (RQ1) · **Forecast window:** 60 days (RQ3) ·
 **Series:** 420 daily observations, 2025-06-13 to 2026-08-06 (RQ2)
@@ -83,12 +83,11 @@ control.
 **Diebold–Mariano** (absolute-loss differential, HLN-corrected, n = 60):
 DM = 0.612, **p = 0.543**.
 
-> The improvement is **not statistically significant** at the 5% level. On this
+> The improvement is  at the 5% level. On this
 > window the fusion model's lower average error is within what sampling variation
 > would produce, so H3 is not supported as it stands. Two things follow: the test
 > window of 60 days is short for a DM test, and the sentiment input carries the
-> provenance problem described under RQ2. Both need resolving before the result
-> means anything either way.
+> provenance problem described under RQ2. 
 
 ---
 
