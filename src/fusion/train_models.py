@@ -2,12 +2,12 @@
 """
 src/fusion/train_models.py
 ===========================
-Stage 4 — Train All Forecasting Arms and Write forecasts.csv (answers RQ3)
+Stage 4 — Train All Forecasting Arms and Write forecasts.csv 
 
 Trains five forecasting model arms and saves their test-set predictions to
 data/processed/forecasts.csv — the third CSV required by ch6_analysis.py.
 
-Model arms (matching Chapter 6 Table 6.3):
+Model arms:
   B3  — ARIMA(2,1,2)              [classical baseline]
   B4  — XGBoost                   [non-sequential baseline]
   B5  — LSTM (price-only)         [deep control — primary RQ3 comparison]
