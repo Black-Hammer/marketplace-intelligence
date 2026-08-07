@@ -65,7 +65,7 @@ Marketplace Prices ────►│ LSTM Price Encoder  │──► Temporal 
 
 ```bash
 # 1. Clone the repository
-git clone https://github.com/Black-Hammer/marketplace-intelligence.git
+git clone https://github.com/abu-salawu/marketplace-intelligence.git
 cd marketplace-intelligence
 
 # 2. Install dependencies
